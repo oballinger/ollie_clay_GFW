@@ -21,41 +21,81 @@ from sklearn import decomposition
 import numpy as np
 import math
 from torchvision.transforms import v2
-sys.path.append("../..")
 from src.model import ClayMAEModule
 import torch
 import torch.nn as nn
 import time
-import xarray as xr
 import os 
+import xarray as xr
 import ee
 
-if torch.cuda.is_available():
-    device = torch.device("cpu")
-else:
-    device = torch.device("cpu")
+
 ee.Initialize()
-#print(f"Using device: {device}")
+sys.path.append("../..")
+device = torch.device("cpu")
 
 def load_model():
-    # Set device
-    device = torch.device("cpu") if torch.cuda.is_available() else torch.device("cpu")
+    """
+    Loads the ClayMAEModule model from a specified checkpoint and sets it to evaluation mode.
+    The function performs the following steps:
+    1. Sets the device to CPU. CPU inference is sufficient and easier to parallelize, but if we want to do
+    huge batch processing of e.g. planet data we can integrate GPU support here. 
+    2. Downloads the model checkpoint from a specified URL.
+    3. Loads the model from the checkpoint with specified metadata, shuffle, and mask ratio parameters.
+    4. Sets the model to evaluation mode.
+    5. Adjusts the batch_first attribute for Transformer encoder layers.
+    6. Moves the model to the specified device.
+    Returns:
+        model (ClayMAEModule): The loaded model set to evaluation mode.
+        device (torch.device): The device on which the model is loaded.
+    """
+
+    #device = torch.device("gpu") if torch.cuda.is_available() else torch.device("cpu")
+    device = torch.device("cpu")
     ckpt = "https://huggingface.co/made-with-clay/Clay/resolve/main/clay-v1-base.ckpt"
     torch.set_default_device(device)
 
-    # Load model
     model = ClayMAEModule.load_from_checkpoint(
         ckpt, metadata_path="configs/metadata.yaml", shuffle=False, mask_ratio=0
     )
     model.eval()
     for module in model.modules():
-            if isinstance(module, nn.Transformer):
-                module.encoder_layer.self_attn.batch_first = True
+        if isinstance(module, nn.Transformer):
+            module.encoder_layer.self_attn.batch_first = True
         
     model.to(device)
     return model, device
 
 class Thumbnail:
+    """
+    A class to represent a thumbnail image with associated metadata. Two instances of this class is created for each 
+    detection, one for Sentinel-1 and one for Sentinel-2.
+    Attributes:
+    -----------
+    detect_id : str
+        The detection ID of the thumbnail.
+    data : ndarray
+        The image data of the thumbnail.
+    start : str
+        The start date of the detection period.
+    end : str
+        The end date of the detection period.
+    lon : float
+        The longitude coordinate of the detection.
+    lat : float
+        The latitude coordinate of the detection.
+    platform : str, optional
+        The platform from which the image was captured (default is None).
+    embedding : None
+        Placeholder for embedding data (default is None).
+    gsd : int, optional
+        The ground sample distance of the image (default is None).
+    Methods:
+    --------
+    load_detection(i, z):
+        Static method to load detection data and create Thumbnail instances for Sentinel-1 and Sentinel-2 platforms.
+    """
+
     def __init__(self, detect_id, data, start, end, lon, lat, gsd=None, platform=None):
         self.detect_id = detect_id
         self.data = data
@@ -69,6 +109,20 @@ class Thumbnail:
 
     @staticmethod
     def load_detection(i, z):
+        """
+        Load detection data and create Thumbnail objects for Sentinel-1 and Sentinel-2.
+        Args:
+            i (int): Index of the detection in the dataset.
+            z (dict): Dictionary containing detection data with keys 'detect_id', 'tiles_s1', and 'tiles_s2'.
+        Returns:
+            tuple: A tuple containing two Thumbnail objects:
+                - s1 (Thumbnail): Thumbnail object for Sentinel-1 data.
+                - s2 (Thumbnail): Thumbnail object for Sentinel-2 data.
+        Raises:
+            KeyError: If the required keys are not present in the dictionary `z`.
+            ValueError: If the detection ID format is incorrect or cannot be parsed.
+        """
+
         detect_id = z['detect_id'][i]
         id_parts = detect_id.split('_')
         start=parse(id_parts[4]).strftime('%Y-%m-%d')
@@ -86,6 +140,20 @@ class Thumbnail:
         return s1, s2
 
 def to_xarray(thumbnail):
+    """
+    Convert a thumbnail object to an xarray DataArray.
+    Parameters:
+    thumbnail (object): An object containing the thumbnail data and metadata. 
+                        It must have the following attributes:
+                        - platform (str): The platform of the thumbnail, either 'sentinel-1-grd' or 'sentinel-2-l2a'.
+                        - data (ndarray): The image data as a NumPy array.
+                        - start (str): The start time of the thumbnail in a format that can be parsed by pandas.to_datetime.
+                        - gsd (float): The ground sampling distance of the thumbnail.
+    Returns:
+    xarray.DataArray: A DataArray containing the rescaled image data with appropriate coordinates and attributes.
+                      The dimensions are ordered as (time, band, y, x).
+    """
+    
     # from the get_stats_df function
     s1_median = {'VH_min': 0.0004993189359083772,
     'VH_max': 0.13001450896263123,
@@ -125,6 +193,27 @@ def to_xarray(thumbnail):
 
 
 def apply_model(model, device, thumbnail):
+    """
+    Apply the pretrained clay model to a thumbnail image and return the embeddings.
+    
+    Parameters:
+    model (torch.nn.Module): The model to be applied.
+    device (torch.device): The device on which to perform computations.
+    thumbnail (Thumbnail): The thumbnail image containing the stack and metadata.
+    
+    Returns:
+    numpy.ndarray: The embeddings generated by the model.
+    The function performs the following steps:
+    1. Normalize the timestamp and latitude/longitude of the thumbnail.
+    2. Extract mean, standard deviation, and wavelengths from metadata.
+    3. Normalize the pixel values of the stack.
+    4. Prepare a datacube with normalized time, latitude/longitude, pixel values, ground sample distance (gsd), and wavelengths.
+    5. Apply the model's encoder to the datacube to obtain embeddings.
+    
+    Helper Functions:
+    - normalize_timestamp(date): Normalize the timestamp to sine and cosine components of week and hour.
+    - normalize_latlon(lat, lon): Normalize latitude and longitude to sine and cosine components.
+    """
 
     def normalize_timestamp(date):
         week = date.isocalendar().week * 2 * np.pi / 52
@@ -190,6 +279,16 @@ def apply_model(model, device, thumbnail):
     return embeddings
 
 def write_embeddings(detect_id, embeddings, out_dir):
+    """
+    Save embeddings to a compressed .npz file in the specified output directory.
+    Parameters:
+    detect_id (str): Identifier for the detection, used to name the output file.
+    embeddings (tuple): A tuple containing two arrays of embeddings (s1 and s2).
+    out_dir (str): The directory where the output file will be saved.
+    Returns:
+    str: The path to the saved .npz file.
+    """
+
     # Ensure the output directory exists
     os.makedirs(out_dir, exist_ok=True)
 
@@ -201,6 +300,18 @@ def write_embeddings(detect_id, embeddings, out_dir):
     return embeddings_path
 
 def get_embeddings_single_process(z, indices, model, out_dir):
+    """
+    Processes a list of detection indices to generate embeddings using a specified model.
+    Args:
+        z (object): An object containing necessary data for loading detections.
+        indices (list): A list of detection indices to process.
+        model (object): The model to be used for generating embeddings.
+        out_dir (str): The directory where the embeddings will be saved.
+    Returns:
+        None
+    Raises:
+        Exception: If there is an error processing a detection, it will be caught and printed.
+    """
 
     for i in tqdm(indices, desc="Processing detections", unit="detection"):
         try:
@@ -218,6 +329,18 @@ def get_embeddings_single_process(z, indices, model, out_dir):
             print(f"Error processing detection {i}: {e}")
 
 def write_zarr(embeddings_dir, in_zarr):
+    """
+    Reads .npz files containing embeddings from a specified directory, sorts them according to the order of detect_ids 
+    in an input Zarr file, and writes the sorted embeddings to a new Zarr file.
+    Args:
+        embeddings_dir (str): The directory containing the .npz files with embeddings.
+        in_zarr (str): The path to the input Zarr file.
+    Returns:
+        None
+    Raises:
+        KeyError: If a detect_id from the .npz files is not found in the input Zarr file.
+    """
+
     s1 = []
     s2 = []
     detect_ids=[]
@@ -248,6 +371,18 @@ def write_zarr(embeddings_dir, in_zarr):
     z_out.create_dataset("s2_embeddings", data=sorted_s2)
 
 def run_pipeline(in_zarr, out_dir):
+    """
+    Run the data processing pipeline in parallel.
+    This function processes data stored in a Zarr file, splits the data into batches,
+    and processes each batch in parallel using multiple CPU cores. The results are
+    then written to the specified output directory.
+    Parameters:
+    in_zarr (str): Path to the input Zarr file.
+    out_dir (str): Path to the output directory where results will be saved.
+    Returns:
+    None
+    """
+    
     print('Running pipeline')
     num_cores = multiprocessing.cpu_count()
     z = zarr.open(in_zarr, mode="r")
@@ -266,63 +401,19 @@ def run_pipeline(in_zarr, out_dir):
     write_zarr(out_dir, in_zarr)
 
 
-def search_catalog(thumbnail):
-    STAC_API = "https://earth-search.aws.element84.com/v1"
-    catalog = pystac_client.Client.open(STAC_API)
-    kwargs={'collections':[thumbnail.platform],
-            'datetime':f"{thumbnail.start}/{thumbnail.end}",
-            'bbox':(thumbnail.lon - 1e-5, thumbnail.lat - 1e-5, thumbnail.lon + 1e-5, thumbnail.lat + 1e-5),
-            'max_items':1}
-    if "2" in thumbnail.platform:
-        kwargs['query']={"eo:cloud_cover": {"lt": 50}}
-    search = catalog.search(**kwargs)
-    stac_item = search.item_collection()[0]
-    return stac_item
-
-def calculate_bounds(thumbnail, stac_item, size=100):
-    epsg = stac_item.properties["proj:epsg"]
-    gsd=thumbnail.gsd
-    poidf = gpd.GeoDataFrame(
-        pd.DataFrame(),
-        crs="EPSG:4326",
-        geometry=[Point(thumbnail.lon, thumbnail.lat)],
-    ).to_crs(epsg)
-
-    coords = poidf.iloc[0].geometry.coords[0]
-    
-    bounds = (
-        coords[0] - (size * gsd) // 2,
-        coords[1] - (size * gsd) // 2,
-        coords[0] + (size * gsd) // 2,
-        coords[1] + (size * gsd) // 2,
-    )
-    
-    return bounds, epsg
-
-def stack_stac(stac_item, bounds, epsg, gsd):
-    if stac_item.collection_id == "sentinel-1-grd":
-        assets=["vv","vh"]
-    elif stac_item.collection_id == "sentinel-2-l2a":
-        assets=["blue", "green", "red", "nir"]
-
-    stack = stackstac.stack(
-        stac_item,
-        bounds=bounds,
-        snap_bounds=False,
-        epsg=epsg,
-        resolution=gsd,
-        #dtype="float32",
-        rescale=False,
-        fill_value=0,
-        assets=assets,
-        resampling=Resampling.nearest,
-    )
-    stack = stack.compute()
-
-    return stack
-
-
 def get_s2_sr_cld_col(aoi, start_date, end_date):
+    """
+    Retrieves a Sentinel-2 Surface Reflectance (S2 SR) image collection filtered by area of interest (AOI), 
+    date range, and cloud coverage, and joins it with the Sentinel-2 cloud probability collection.
+    Args:
+        aoi (ee.Geometry): The area of interest to filter the image collection.
+        start_date (str): The start date for the image collection filter in 'YYYY-MM-DD' format.
+        end_date (str): The end date for the image collection filter in 'YYYY-MM-DD' format.
+    Returns:
+        ee.ImageCollection: An Earth Engine ImageCollection with the S2 SR images joined with the 
+                            corresponding cloud probability images from the S2 cloud probability collection.
+    """
+    
     CLOUD_FILTER = 60
 
     # Import and filter S2 SR.
@@ -347,29 +438,22 @@ def get_s2_sr_cld_col(aoi, start_date, end_date):
     }))
 
 
-def get_s2_sr_cld_col(aoi, start_date, end_date):
-    CLOUD_FILTER = 60
-    s2_sr_col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-        .filterBounds(aoi)
-        .filterDate(start_date, end_date)
-        .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', CLOUD_FILTER)))
-
-    # Import and filter s2cloudless.
-    s2_cloudless_col = (ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
-        .filterBounds(aoi)
-        .filterDate(start_date, end_date))
-
-    # Join the filtered s2cloudless collection to the SR collection by the 'system:index' property.
-    return ee.ImageCollection(ee.Join.saveFirst('s2cloudless').apply(**{
-        'primary': s2_sr_col,
-        'secondary': s2_cloudless_col,
-        'condition': ee.Filter.equals(**{
-            'leftField': 'system:index',
-            'rightField': 'system:index'
-        })
-    }))
 
 def stack_gee(thumbnail):
+    """
+    Processes satellite imagery from Google Earth Engine (GEE) based on the given thumbnail parameters. Used for 
+    converting the thumbnail data from 0-255 to the sensor's native units.
+    Args:
+        thumbnail (object): An object containing the following attributes:
+            - lat (float): Latitude of the point of interest.
+            - lon (float): Longitude of the point of interest.
+            - platform (str): The satellite platform, either "sentinel-1-grd" or "sentinel-2-l2a".
+            - start (str): The start date for the image collection period.
+            - end (str): The end date for the image collection period.
+            - gsd (float): The ground sampling distance (resolution) for the image.
+    Returns:
+        pd.DataFrame: A DataFrame containing the minimum and maximum values for each band in the selected image collection.
+    """
 
     lat, lon = thumbnail.lat, thumbnail.lon
     pt = ee.Geometry.Point(lon, lat)
@@ -408,6 +492,16 @@ def stack_gee(thumbnail):
 
 
 def get_stats(i, z):
+    """
+    Computes statistics for detection thumbnails.
+    Args:
+        i (int): An identifier for the detection.
+        z (int): A parameter used for loading the detection thumbnail.
+    Returns:
+        tuple: A tuple containing two elements:
+            - s1_stats: Statistics for the first detection thumbnail.
+            - s2_stats: Statistics for the second detection thumbnail.
+    """
     # Load the detection thumbnail
     s2, s1 = Thumbnail.load_detection(i, z)
     
@@ -418,6 +512,23 @@ def get_stats(i, z):
     return s1_stats, s2_stats
 
 def get_stats_df(z, n=100):
+    """
+    Generate median statistics from random samples.
+
+    This function generates random indices, retrieves statistics for each index,
+    and calculates the median of these statistics. This is used later on convert 
+    the thumbnails from 0-255 to the sensor's native units. Would not be necessary 
+    if the data was already in the sensor's native units.
+
+    Parameters:
+    z (any): A parameter to be passed to the get_stats function.
+    n (int, optional): The number of random samples to generate. Default is 100.
+
+    Returns:
+    tuple: A tuple containing two dictionaries:
+        - s1_median (dict): Median statistics for the first set.
+        - s2_median (dict): Median statistics for the second set.
+    """
     random_indices = np.random.choice(50000, n)
 
     s1_df=pd.DataFrame()
@@ -435,12 +546,38 @@ def get_stats_df(z, n=100):
     return s1_median, s2_median
 
 def stretch(image, target_min=0, target_max=1):
+    """
+    Stretches the pixel values of an image to a specified range, in this case from 
+    0-255 to the range of the sensor. The image is first normalized to the range 0-1,
+    then stretched to the specified target range.
+
+    Parameters:
+    image (numpy.ndarray): The input image to be stretched.
+    target_min (float, optional): The minimum value of the target range. Default is 0.
+    target_max (float, optional): The maximum value of the target range. Default is 1.
+    Returns:
+    numpy.ndarray: The image with pixel values stretched to the specified range.
+    """
+
     image=image.astype(np.float32)
     normalized=image/255
     stretched = normalized * (target_max - target_min) + target_min
     return stretched.astype(np.float32)
 
 def rescale(thumbnail, minmax_df):
+    """
+    Rescales the data in a thumbnail image based on the platform type and provided min-max values.
+    Parameters:
+    thumbnail (object): An object containing the image data and platform type. 
+                        The data attribute is expected to be a 3D numpy array.
+    minmax_df (DataFrame): A pandas DataFrame containing the min and max values for rescaling.
+    Returns:
+    numpy.ndarray: The rescaled image data as a 3D numpy array with dtype float32.
+    Notes:
+    - For 'sentinel-1-grd' platform, the data is expected to have two channels (VH and VV).
+    - For 'sentinel-2-l2a' platform, the data is expected to have four channels (B8, B2, B3, B4).
+    """
+
     if thumbnail.platform == 'sentinel-1-grd':
         vh=stretch(thumbnail.data[:,:,0], minmax_df['VH_min'], minmax_df['VH_max'])
         vv=stretch(thumbnail.data[:,:,1], minmax_df['VV_min'], minmax_df['VV_max'])
@@ -453,3 +590,67 @@ def rescale(thumbnail, minmax_df):
         data=np.stack([nir, blue, green, red], axis=-1)
 
     return data.astype(np.float32)
+
+
+
+# ------------------------------------ old functions ------------------------------------
+"""
+These functions are not used in the current pipeline but are kept for reference
+they allow for the retrieval of data from the STAC catalog and the stacking of the data
+into a single xarray dataset. In case we want to move away from GEE.
+"""
+
+def stack_stac(stac_item, bounds, epsg, gsd):
+    if stac_item.collection_id == "sentinel-1-grd":
+        assets=["vv","vh"]
+    elif stac_item.collection_id == "sentinel-2-l2a":
+        assets=["blue", "green", "red", "nir"]
+
+    stack = stackstac.stack(
+        stac_item,
+        bounds=bounds,
+        snap_bounds=False,
+        epsg=epsg,
+        resolution=gsd,
+        #dtype="float32",
+        rescale=False,
+        fill_value=0,
+        assets=assets,
+        resampling=Resampling.nearest,
+    )
+    stack = stack.compute()
+    return stack
+
+
+def search_catalog(thumbnail):
+    STAC_API = "https://earth-search.aws.element84.com/v1"
+    catalog = pystac_client.Client.open(STAC_API)
+    kwargs={'collections':[thumbnail.platform],
+            'datetime':f"{thumbnail.start}/{thumbnail.end}",
+            'bbox':(thumbnail.lon - 1e-5, thumbnail.lat - 1e-5, thumbnail.lon + 1e-5, thumbnail.lat + 1e-5),
+            'max_items':1}
+    if "2" in thumbnail.platform:
+        kwargs['query']={"eo:cloud_cover": {"lt": 50}}
+    search = catalog.search(**kwargs)
+    stac_item = search.item_collection()[0]
+    return stac_item
+
+def calculate_bounds(thumbnail, stac_item, size=100):
+    epsg = stac_item.properties["proj:epsg"]
+    gsd=thumbnail.gsd
+    poidf = gpd.GeoDataFrame(
+        pd.DataFrame(),
+        crs="EPSG:4326",
+        geometry=[Point(thumbnail.lon, thumbnail.lat)],
+    ).to_crs(epsg)
+
+    coords = poidf.iloc[0].geometry.coords[0]
+    
+    bounds = (
+        coords[0] - (size * gsd) // 2,
+        coords[1] - (size * gsd) // 2,
+        coords[0] + (size * gsd) // 2,
+        coords[1] + (size * gsd) // 2,
+    )
+    
+    return bounds, epsg
