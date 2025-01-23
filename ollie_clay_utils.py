@@ -61,7 +61,6 @@ def load_model(device):
             module.encoder_layer.self_attn.batch_first = True
         
     model.to(device)
-    print("Loaded", ckpt)
     return model, device
 
 

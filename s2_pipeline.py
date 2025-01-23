@@ -84,6 +84,13 @@ def check_bq_table_exists(dataset_id, table_id):
         return True
     except:
         return False
+    
+def check_processed_dates(dataset_id):
+    client = bigquery.Client(project='world-fishing-827')
+    dataset_ref = client.dataset(dataset_id)
+    tables = client.list_tables(dataset_ref)
+    dates = [table.table_id.split('_')[-1] for table in tables if table.table_id.startswith('sentinel2_world_v20230811_embeddings_')]
+    return dates    
 
 def get_embeddings_from_png(file, model, device=torch.device("cpu")):
     try:
@@ -171,7 +178,8 @@ def run_year_threaded(year):
     delta = end - start
     dates = [start + timedelta(days=i) for i in range(delta.days + 1)]
     dates = [d.strftime('%Y%m%d') for d in dates]
-    
+    processed=check_processed_dates('scratch_ollie')
+    dates=[date for date in dates if date not in processed]
     semaphore = threading.Semaphore(2)
 
     def process_date(date):
@@ -182,7 +190,7 @@ def run_year_threaded(year):
 
     def download_next_date(next_date):
         try:
-            while len(os.listdir('data/tmp')) >= 5:
+            while len(os.listdir('data/tmp')) >= 2:
                 time.sleep(5)  # Wait for 5 seconds before checking again
             download_thumbnails(next_date)
         except Exception as e:
@@ -199,13 +207,9 @@ def run_year_threaded(year):
     for i in range(len(dates)):
         date = dates[i]
         next_date = dates[i + 1] if i + 1 < len(dates) else None
-        skip = check_bq_table_exists('scratch_ollie', f'sentinel2_world_v20230811_embeddings_{date}')
-        if skip:
-            print(f"{date} already processed")
-        else:
-            if next_date:
-                threading.Thread(target=download_next_date, args=(next_date,)).start()
-            process_date(date)
+        if next_date:
+            threading.Thread(target=download_next_date, args=(next_date,)).start()
+        process_date(date)
 
 
 if __name__ == "__main__":
