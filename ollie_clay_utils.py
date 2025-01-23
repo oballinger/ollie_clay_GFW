@@ -1,5 +1,5 @@
 import time 
-import stackstac
+#import stackstac
 from rasterio.enums import Resampling
 import sys
 from joblib import Parallel, delayed
@@ -8,7 +8,7 @@ from tqdm import tqdm
 import time
 import zarr
 from dateutil.parser import parse
-import pystac_client
+#import pystac_client
 import geopandas as gpd
 import pandas as pd
 from shapely import Point
@@ -21,50 +21,49 @@ from sklearn import decomposition
 import numpy as np
 import math
 from torchvision.transforms import v2
-from src.model import ClayMAEModule
 import torch
 import torch.nn as nn
 import time
 import os 
 import xarray as xr
 import ee
+from PIL import Image
+import numpy as np
+from google.cloud import bigquery
+from glob import glob
 
+#ee.Initialize()
+sys.path.append("model")
 
-ee.Initialize()
-sys.path.append("../..")
-device = torch.device("cpu")
+from src.module import ClayMAEModule
 
-def load_model():
-    """
-    Loads the ClayMAEModule model from a specified checkpoint and sets it to evaluation mode.
-    The function performs the following steps:
-    1. Sets the device to CPU. CPU inference is sufficient and easier to parallelize, but if we want to do
-    huge batch processing of e.g. planet data we can integrate GPU support here. 
-    2. Downloads the model checkpoint from a specified URL.
-    3. Loads the model from the checkpoint with specified metadata, shuffle, and mask ratio parameters.
-    4. Sets the model to evaluation mode.
-    5. Adjusts the batch_first attribute for Transformer encoder layers.
-    6. Moves the model to the specified device.
-    Returns:
-        model (ClayMAEModule): The loaded model set to evaluation mode.
-        device (torch.device): The device on which the model is loaded.
-    """
+#device = torch.device("cuda")
+#device = torch.device("cpu")
+#os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
-    #device = torch.device("gpu") if torch.cuda.is_available() else torch.device("cpu")
-    device = torch.device("cpu")
-    ckpt = "https://huggingface.co/made-with-clay/Clay/resolve/main/clay-v1-base.ckpt"
-    torch.set_default_device(device)
+def load_model(device):
+    #device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    torch.cuda.empty_cache()
+
+    # Path to the checkpoint
+    ckpt = "clay-v1.5.ckpt"
+    current_dir = os.getcwd()
+    metadata_path = os.path.join(current_dir, "model/configs", "metadata.yaml")
 
     model = ClayMAEModule.load_from_checkpoint(
-        ckpt, metadata_path="configs/metadata.yaml", shuffle=False, mask_ratio=0
-    )
+        ckpt, metadata_path=metadata_path, shuffle=False, mask_ratio=0
+    ).to(device)
     model.eval()
+    model.batch_first=True
+
     for module in model.modules():
         if isinstance(module, nn.Transformer):
             module.encoder_layer.self_attn.batch_first = True
         
     model.to(device)
+    print("Loaded", ckpt)
     return model, device
+
 
 class Thumbnail:
     """
@@ -131,13 +130,25 @@ class Thumbnail:
         #end = (parse(id_parts[5]) + pd.DateOffset(months=-2)).strftime('%Y-%m-%d')
         lon, lat = [float(x) for x in id_parts[-1].split(';')[-2:]]
 
-        zs2 = z['tiles_s2'][i][:, :, :]
-        zs1 = z['tiles_s1'][i][:, :, :]
-       
-        s1 = Thumbnail(detect_id, zs1, start, end, lon, lat, platform='sentinel-1-grd', gsd=20)
-        s2 = Thumbnail(detect_id, zs2, start, end, lon, lat, platform='sentinel-2-l2a', gsd=10)
+        s2_tile = z['tiles_s2'][i][:, :, :]
+        s1_tile = z['tiles_s1'][i][:, :, :]
+
+        s1 = Thumbnail(detect_id, s1_tile, start, end, lon, lat, platform='sentinel-1-grd', gsd=20)
+        s2 = Thumbnail(detect_id, s2_tile, start, end, lon, lat, platform='sentinel-2-l2a', gsd=10)
 
         return s1, s2
+    
+    def load_s2_png(file):
+        rgb=np.array(Image.open(file))[:,:,::-1]
+        nir=np.array(Image.open(file.replace('RGB','NIR')))
+        data=np.dstack([nir,rgb])
+        lon, lat = [float(x.split('_')[0]) for x in file.split(';')[-2:]]
+        date=parse(file.split('_')[2]).strftime('%Y-%m-%d')
+        detect_id=file.split('/')[-1].replace('.png','')
+        thumbnail= Thumbnail(detect_id, data, date, date, lon, lat, platform='sentinel-2-l2a', gsd=10)
+        to_xarray(thumbnail)
+        return thumbnail
+        
 
 def to_xarray(thumbnail):
     """
@@ -229,8 +240,9 @@ def apply_model(model, device, thumbnail):
 
     # Extract mean, std, and wavelengths from metadata
     platform = thumbnail.platform.replace("grd",'rtc')
-
-    metadata = Box(yaml.safe_load(open("configs/metadata.yaml")))
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    metadata_path = os.path.join(current_dir, "model/configs", "metadata.yaml")
+    metadata = Box.from_yaml(filename=metadata_path)
     mean, std, waves = [], [], []
 
     for band in stack.band:
@@ -278,6 +290,91 @@ def apply_model(model, device, thumbnail):
     embeddings = unmsk_patch[:, 0, :].cpu().numpy()
     return embeddings
 
+def apply_model_batched(model, device, thumbnails):
+    """
+    Apply the pretrained clay model to a batch of thumbnail images and return the embeddings.
+
+    Parameters:
+    model (torch.nn.Module): The model to be applied.
+    device (torch.device): The device on which to perform computations.
+    thumbnails (list of Thumbnail): A list of thumbnail images containing stacks and metadata.
+
+    Returns:
+    list of numpy.ndarray: A list of embeddings generated by the model for each thumbnail.
+
+    Helper Functions:
+    - normalize_timestamp(date): Normalize the timestamp to sine and cosine components of week and hour.
+    - normalize_latlon(lat, lon): Normalize latitude and longitude to sine and cosine components.
+    """
+    
+    def normalize_timestamp(date):
+        week = date.isocalendar().week * 2 * np.pi / 52
+        hour = date.hour * 2 * np.pi / 24
+        return (math.sin(week), math.cos(week)), (math.sin(hour), math.cos(hour))
+
+    def normalize_latlon(lat, lon):
+        lat = lat * np.pi / 180
+        lon = lon * np.pi / 180
+        return (math.sin(lat), math.cos(lat)), (math.sin(lon), math.cos(lon))
+
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    metadata_path = os.path.join(current_dir, "model/configs", "metadata.yaml")
+    metadata = Box.from_yaml(filename=metadata_path)
+
+    embeddings_list = []
+
+    for thumbnail in thumbnails:
+        stack = thumbnail.stack
+
+        # Extract mean, std, and wavelengths from metadata
+        platform = thumbnail.platform.replace("grd", "rtc")
+        mean, std, waves = [], [], []
+
+        for band in stack.band:
+            mean.append(metadata[platform].bands.mean[str(band.values)])
+            std.append(metadata[platform].bands.std[str(band.values)])
+            waves.append(metadata[platform].bands.wavelength[str(band.values)])
+
+        transform = v2.Compose([v2.Normalize(mean=mean, std=std)])
+
+        datetimes = stack.time.values.astype("datetime64[s]").tolist()
+        times = [normalize_timestamp(dat) for dat in datetimes]
+        week_norm = [dat[0] for dat in times]
+        hour_norm = [dat[1] for dat in times]
+
+        latlons = [normalize_latlon(thumbnail.lat, thumbnail.lon)] * len(times)
+        lat_norm = [dat[0] for dat in latlons]
+        lon_norm = [dat[1] for dat in latlons]
+
+        # Normalize pixels
+        pixels = torch.from_numpy(stack.data.astype(np.float32))
+        pixels = transform(pixels)
+
+        # Prepare datacube
+        datacube = {
+            "platform": platform,
+            "time": torch.tensor(
+                np.hstack((week_norm, hour_norm)),
+                dtype=torch.float32,
+                device=device,
+            ),
+            "latlon": torch.tensor(
+                np.hstack((lat_norm, lon_norm)), dtype=torch.float32, device=device
+            ),
+            "pixels": pixels.to(device),
+            "gsd": torch.tensor(stack.gsd.values, device=device),
+            "waves": torch.tensor(waves, device=device),
+        }
+
+        with torch.no_grad():
+            unmsk_patch, unmsk_idx, msk_idx, msk_matrix = model.model.encoder(datacube)
+
+        embeddings = unmsk_patch[:, 0, :].cpu().numpy()
+        embeddings_list.append(embeddings)
+
+    return embeddings_list
+
+
 def write_embeddings(detect_id, embeddings, out_dir):
     """
     Save embeddings to a compressed .npz file in the specified output directory.
@@ -299,7 +396,7 @@ def write_embeddings(detect_id, embeddings, out_dir):
 
     return embeddings_path
 
-def get_embeddings_single_process(z, indices, model, out_dir):
+def get_embeddings_single_process(z, indices, model, out_dir=None):
     """
     Processes a list of detection indices to generate embeddings using a specified model.
     Args:
@@ -312,21 +409,28 @@ def get_embeddings_single_process(z, indices, model, out_dir):
     Raises:
         Exception: If there is an error processing a detection, it will be caught and printed.
     """
-
-    for i in tqdm(indices, desc="Processing detections", unit="detection"):
+    embeddings_df=pd.DataFrame()
+    for i in tqdm(indices, desc="Extracting Embeddings", unit="detection"):
         try:
             s2, s1 = Thumbnail.load_detection(i, z)
             detect_id = s2.detect_id
-            embeddings = []
-
+            embeddings = []       
             for thumbnail in [s1, s2]:
                 #stac_item = search_catalog(thumbnail)
                 to_xarray(thumbnail)
                 embedding = apply_model(model, device, thumbnail)
                 embeddings.append(embedding)
-            write_embeddings(detect_id, embeddings, out_dir)
+            if out_dir:
+                write_embeddings(detect_id, embeddings, out_dir)
+            else:
+                row=pd.DataFrame({'detect_id':detect_id, 's1_embeddings':[embeddings[0].flatten()], 's2_embeddings':[embeddings[1].flatten()]})
+                embeddings_df=pd.concat([embeddings_df, row])
         except Exception as e:
             print(f"Error processing detection {i}: {e}")
+        
+    return embeddings_df
+        
+
 
 def write_zarr(embeddings_dir, in_zarr):
     """
@@ -370,10 +474,10 @@ def write_zarr(embeddings_dir, in_zarr):
     z_out.create_dataset("s1_embeddings", data=sorted_s1)
     z_out.create_dataset("s2_embeddings", data=sorted_s2)
 
-def run_pipeline(in_zarr, out_dir):
+def run_pipeline(input, out_dir=None, n_jobs=-1, verbose=True):
     """
     Run the data processing pipeline in parallel.
-    This function processes data stored in a Zarr file, splits the data into batches,
+    This function processes data stored in a Zarr file or dataframe, splits the data into batches,
     and processes each batch in parallel using multiple CPU cores. The results are
     then written to the specified output directory.
     Parameters:
@@ -383,22 +487,37 @@ def run_pipeline(in_zarr, out_dir):
     None
     """
     
-    print('Running pipeline')
-    num_cores = multiprocessing.cpu_count()
-    z = zarr.open(in_zarr, mode="r")
+    #print('Running pipeline')
+        #if input is str
+    if isinstance(input, str):
+        z = zarr.open(input, mode="r")
+    else:
+        z=input
+
     model, _ = load_model()
     
     # Split data into batches
     indices = list(range(len(z['detect_id'])))
-    batch_size = len(indices) // num_cores
+    
+    batch_size = len(indices) // n_jobs
+    
     batches = [indices[i:i + batch_size] for i in range(0, len(indices), batch_size)]
 
-    # Process batches in parallel
-    Parallel(n_jobs=num_cores)(
-        delayed(get_embeddings_single_process)(z, batch, model, out_dir) for batch in batches
-    )
+   # Process batches in parallel and combine into one dataframe
+   
+    if n_jobs == 1:
+        embdeddings_df=get_embeddings_single_process(z, indices, model, out_dir)
+    else:
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(get_embeddings_single_process)(z, batch, model, out_dir) for batch in batches
+        )
+        embdeddings_df=pd.concat(results)
 
-    write_zarr(out_dir, in_zarr)
+    
+    if out_dir:
+        write_zarr(out_dir, input)
+    else :
+        return embdeddings_df
 
 
 def get_s2_sr_cld_col(aoi, start_date, end_date):
@@ -502,6 +621,7 @@ def get_stats(i, z):
             - s1_stats: Statistics for the first detection thumbnail.
             - s2_stats: Statistics for the second detection thumbnail.
     """
+
     # Load the detection thumbnail
     s2, s1 = Thumbnail.load_detection(i, z)
     
@@ -529,6 +649,7 @@ def get_stats_df(z, n=100):
         - s1_median (dict): Median statistics for the first set.
         - s2_median (dict): Median statistics for the second set.
     """
+    ee.Initialize()
     random_indices = np.random.choice(50000, n)
 
     s1_df=pd.DataFrame()
@@ -590,6 +711,15 @@ def rescale(thumbnail, minmax_df):
         data=np.stack([nir, blue, green, red], axis=-1)
 
     return data.astype(np.float32)
+
+
+
+
+
+
+
+
+
 
 
 
